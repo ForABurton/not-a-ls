@@ -2072,6 +2072,338 @@ def classify_project_type(path):
     if is_git_repo(path): return "git"
     return None
 
+
+
+import os, base64, tarfile, tempfile
+
+TAR_SUFFIX = ".notals-tmp.tar"
+
+KITTYPREFIX = "\x1b]1337;File="
+KITTYSTOP = "\x07"  # BEL terminator
+
+osc1337_buf = ""  # persistent buffer across iterations
+
+def _process_osc1337_chunks(text, cwd, set_status):
+    """
+    Consume any OSC 1337 File frames inside 'text'.
+    Returns (consumed_up_to_end, leftover), where 'leftover' is any tail
+    that didn't contain a full BEL-terminated frame.
+    """
+    handled_any = False
+
+    # Accumulate into the persistent buffer (closed over outside this func)
+    global osc1337_buf
+    osc1337_buf += text
+
+    # We may have multiple frames; split on BEL but keep the tail
+    parts = osc1337_buf.split(KITTYSTOP)
+    osc1337_buf = parts[-1]  # keep tail with no BEL yet
+    frames = parts[:-1]      # each ended with BEL
+
+    for part in frames:
+        # A part may contain multiple OSCs; we only care about the last File= start
+        # Find all starts, handle each in order (usually just one)
+        start = 0
+        while True:
+            idx = part.find(KITTYPREFIX, start)
+            if idx == -1:
+                break
+            frame = part[idx + len(KITTYPREFIX):]  # content after "File="
+            msg = drag_ops.receive_kitty_file(frame, cwd)
+            if msg:
+                set_status(msg)
+            handled_any = True
+            start = idx + len(KITTYPREFIX)
+
+    return handled_any, osc1337_buf
+
+
+def _flatten_name(name: str):
+    """Remove any directory traversal attempts. Only keep safe basename."""
+    name = name.rstrip("/").strip()
+    base = os.path.basename(name)
+    if base in ("", ".", ".."):
+        return None
+    return base
+
+
+def _prompt_conflict(ui, path):
+    """Ask how to resolve file overwrite conflicts."""
+    choice = ui.list_menu_dialog(
+        ["Overwrite", "Rename", "Cancel"],
+        f"Exists: {os.path.basename(path)}"
+    )
+    return choice  # 0=overwrite, 1=rename, 2/cancel=None
+
+
+class DragInOutOps:
+    """
+    Safe drag-in & drag-out for notals.
+    Uses Kitty File Transfer protocol (OSC 1337).
+    """
+
+    def __init__(self,
+                 pouch_ref,
+                 ui_ref,
+                 *,
+                 default_drag_in_semantics="copy",
+                 drag_out_format="uri",
+                 allow_raw_payload=False,
+                 payload_normalizer=None):
+
+        self.POUCH = pouch_ref
+        self.ui = ui_ref
+        self.default_semantics = default_drag_in_semantics
+        self.drag_out_format = drag_out_format
+        self.allow_raw_payload = allow_raw_payload
+        self.payload_normalizer = payload_normalizer
+
+        # name -> {file: <fileobj>, size: int, dest: str}
+        self._kitty_active_files = {}
+
+    # ------------------------------------------------------------
+    # Receive Kitty File
+    # ------------------------------------------------------------
+
+    def receive_kitty_file(self, encoded_frame, cwd):
+        """
+        Handles streamed Kitty OSC 1337 transfers securely.
+        """
+
+        if ":" not in encoded_frame:
+            return "[Invalid frame]"
+
+        header, b64data = encoded_frame.split(":", 1)
+
+        # Parse metadata safely
+        fields = {}
+        for kv in header.split(";"):
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                fields[k.strip()] = v.strip()
+
+        raw_name = fields.get("name", "")
+        size = int(fields.get("size", "0"))
+        offset = int(fields.get("offset", "0"))
+
+        name = _flatten_name(raw_name)
+        if not name:
+            return "[Rejected: unsafe filename]"
+
+        dest = os.path.join(cwd, name)
+        data = base64.b64decode(b64data)
+
+        # First chunk → handle overwrite / rename
+        if offset == 0:
+            if os.path.exists(dest):
+                choice = _prompt_conflict(self.ui, dest)
+                if choice in (None, 2):
+                    return f"[Skip] {name}"
+                elif choice == 1:
+                    new_name = self.ui.prompt_input(f"Rename '{name}' → ")
+                    if not new_name:
+                        return f"[Skip] {name}"
+                    name = _flatten_name(new_name)
+                    dest = os.path.join(cwd, name)
+
+            try:
+                f = open(dest, "wb")
+            except Exception as e:
+                return f"[Write error: {e}]"
+
+            # Track transfer session
+            self._kitty_active_files[name] = {
+                "file": f,
+                "size": size,
+                "dest": dest,
+            }
+
+        # Following chunks
+        slot = self._kitty_active_files.get(name)
+        if not slot:
+            return f"[Error: unexpected chunk for {name}]"
+
+        f = slot["file"]
+        expected_size = slot["size"]
+
+        f.seek(offset)
+        f.write(data)
+
+        # Complete transfer?
+        if offset + len(data) >= expected_size:
+            f.close()
+            del self._kitty_active_files[name]
+
+            # Directory mode: detect tar suffix and extract
+            if name.endswith(TAR_SUFFIX):
+                final_name = name[:-len(TAR_SUFFIX)]
+                extract_dir = os.path.join(cwd, final_name)
+                os.makedirs(extract_dir, exist_ok=True)
+                try:
+                    with tarfile.open(dest, "r") as tf:
+                        tf.extractall(extract_dir)
+                except Exception as e:
+                    return f"[Extract error: {e}]"
+                os.remove(dest)
+                return f"[Received dir] {final_name}/"
+
+            return f"[Received] {name}"
+
+
+        return f"[Receiving… {name} {offset+len(data)}/{expected_size}]"
+
+    # ------------------------------------------------------------
+    # Request file from terminal (drag-in local → remote)
+    # ------------------------------------------------------------
+    def request_file_from_terminal(self, local_path):
+        name = os.path.basename(local_path.rstrip("/"))
+
+        if os.path.isdir(local_path):
+            msg = (
+                f"\x1b]1337;RequestFile="
+                f"src={local_path};"
+                f"name={name}{TAR_SUFFIX};"
+                f"isdir=1"
+                f"\x07"
+            )
+        else:
+            msg = (
+                f"\x1b]1337;RequestFile="
+                f"src={local_path};"
+                f"name={name};"
+                f"\x07"
+            )
+
+        self.ui.send_raw(msg)
+        return str(msg)
+
+
+    # ------------------------------------------------------------
+    # Drag IN
+    # ------------------------------------------------------------
+    def handle_drag_in(self, cwd, incoming, fallback_print, mode=None):
+        
+        
+        if not isinstance(incoming, (list, tuple)):
+            if not self.allow_raw_payload or not self.payload_normalizer:
+                return ["[Rejected: raw drop payload]"]
+            incoming = self.payload_normalizer(incoming)
+
+        results = []
+        for src in incoming:
+            src = os.path.abspath(src)
+            name = os.path.basename(src)
+            resreqfile = self.request_file_from_terminal(src)
+            results.append(resreqfile)
+            results.append(f"[request file exited] {name}")
+            
+
+        self.ui.show_message("; ".join(results))
+        return results
+        
+        
+        # ------------------------------------------------------------
+    # Drag OUT helpers (remote → local)
+    # ------------------------------------------------------------
+    def _send_file_to_terminal(self, path):
+        """Send a single file to the terminal via OSC 1337."""
+        name = os.path.basename(path)
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except Exception as e:
+            return f"[Send error: {e}]"
+
+        b64 = base64.b64encode(data).decode()
+        msg = f"\x1b]1337;File=name={name};size={len(data)}:{b64}\x07"
+        self.ui.send_raw(msg)
+        return f"[sent] {name}"
+
+    def _send_directory_to_terminal(self, dir_path):
+        """Tar a directory and send the tar."""
+        base = os.path.basename(dir_path.rstrip("/"))
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".notals-out.tar") as tmp:
+            tar_path = tmp.name
+
+        try:
+            with tarfile.open(tar_path, "w") as tf:
+                tf.add(dir_path, arcname=base)
+        except Exception as e:
+            return f"[Dir tar error: {e}]"
+
+        result = self._send_file_to_terminal(tar_path)
+        os.remove(tar_path)
+        return result
+
+    # ------------------------------------------------------------
+    # Drag OUT (public)
+    # ------------------------------------------------------------
+    def handle_drag_out(self, selected_paths):
+        """
+        Remote → local export.
+        Terminal decides where to place drops.
+        """
+        results = []
+        for p in selected_paths:
+            if os.path.isdir(p):
+                results.append(self._send_directory_to_terminal(p))
+            else:
+                results.append(self._send_file_to_terminal(p))
+
+        self.ui.show_message("; ".join(results))
+        return results
+
+
+    # ------------------------------------------------------------
+    # Drag OUT (remote → local)
+    # ------------------------------------------------------------
+    def export_paths(self, selected_paths):
+        if not selected_paths:
+            return ""
+        if self.drag_out_format == "nul":
+            return "\0".join(selected_paths)
+        elif self.drag_out_format == "newline":
+            return "\n".join(selected_paths)
+        elif self.drag_out_format == "uri":
+            return "\n".join(f"file://{p}" for p in selected_paths)
+        raise ValueError(f"Unsupported drag_out_format: {self.drag_out_format}")
+
+
+    # ------------------------------------------------------------
+    # WezTerm Integration Helper
+    # ------------------------------------------------------------
+    @staticmethod
+    def generate_wezterm_drag_integration(notals_command="notals"):
+        return f"""\
+-- ~/.wezterm.lua
+local wezterm = require 'wezterm'
+-- Conceptual: can't yet test on WezTerm on X11
+wezterm.on("drag-drop", function(window, pane, files)
+  local payload = "DROP_IN: " .. table.concat(files, " ") .. "\\n"
+  window:perform_action(wezterm.action.SendString(payload), pane)
+end)
+
+return {{}}
+"""
+
+# Kitty drag to is correctly getting the file path on the local machine in the remote notals, but not yet getting the file
+    @staticmethod
+    def installation_instructions():
+        return """\
+Drag-In now performs immediate transfer via Kitty File Protocol.
+
+Remote (notals) must:
+  • detect OSC 1337 frames
+  • call drag_ops.receive_kitty_file(frame, cwd)
+
+Local (kitty) automatically sends file bytes when requested via:
+  ESC ] 1337;RequestFile=name=FILENAME BEL
+
+
+"""
+
+
+# core UI
 # ----------------- helpers -----------------
 def join(p, name): return os.path.join(p, name)
 def exists(p): return os.path.exists(p)
@@ -3309,6 +3641,24 @@ def safe_make(path, name, set_status):
 def main(stdscr):
     global filter_active, filter_text, breadcrumb_mode, breadcrumb_positions, breadcrumb_index
     
+    # Construct a minimal UI object that can send raw escape sequences
+    class NotalsUIProxy:
+        def __init__(self, scr):
+            self.stdscr = scr
+            self.show_status_function = lambda x:print(x)
+        def send_raw(self, s: str):
+            import sys
+            self.show_status_function("raw"+ s)
+            #breakpoint()
+            sys.stdout.write(s)
+            sys.stdout.flush()
+
+        def show_message(self, msg):
+            self.show_status_function(msg)
+            pass
+            
+
+    
     tool_groups = all_thingtools_classes()
 
     #for m in all_modules:
@@ -3335,6 +3685,19 @@ def main(stdscr):
     def set_status(msg):
         nonlocal status
         status=msg; sadd(stdscr,curses.LINES-3,2," "*(curses.COLS-4)); sadd(stdscr,curses.LINES-3,2,msg)
+        
+        
+    ui1337 = NotalsUIProxy(stdscr)
+    
+    drag_ops = DragInOutOps(
+        pouch_ref=POUCH,   # or your existing pouch list
+        ui_ref=ui1337,
+        default_drag_in_semantics="copy",   # immediate transfer
+        drag_out_format="uri",
+        allow_raw_payload=False,
+        payload_normalizer=None
+    )
+    ui1337.show_status_function = set_status
 
     layout,total_h,vis_h,offset=draw_view(stdscr,path,sel_idx,offset)
     
@@ -3343,7 +3706,92 @@ def main(stdscr):
 
     while True:
 
-        ch=stdscr.getch()
+        # Read one key; keep blocking behavior
+        ch = stdscr.getch()
+
+        # ---------- Paste/drag detection (non-invasive) ----------
+        def _read_more_nowait(max_bytes=8192):
+            # Temporarily nonblocking to drain a paste burst quickly
+            stdscr.nodelay(True)
+            buf = []
+            try:
+                while True:
+                    c = stdscr.getch()
+                    if c == -1:
+                        break
+                    buf.append(c)
+                    if len(buf) >= max_bytes:
+                        break
+            finally:
+                stdscr.nodelay(False)
+            return buf
+
+        def _ints_to_text(seq):
+            # Convert ints -> bytes -> str losslessly for ASCII-ish paste
+            try:
+                return bytes([(c if isinstance(c,int) else c) & 0xFF for c in seq]).decode(errors="ignore")
+            except Exception:
+                return ""
+
+        def _push_back(seq):
+            # Return chars to input so normal flow isn’t broken
+            for c in reversed(seq):
+                curses.ungetch(c)
+
+        # 1) Bracketed paste: ESC [ 200 ~ ... ESC [ 201 ~
+        # 1) ESC-prefixed sequences (OSC / bracketed paste / others)
+        if ch == 27:  # ESC
+            tail = _read_more_nowait()
+            text = _ints_to_text([27] + tail)
+            set_status(f"[attempt consume osc 1337]")
+            # First: try to consume any OSC 1337 File frames in this burst
+            handled, _ = _process_osc1337_chunks(text, path, set_status)
+            if handled:
+                # We consumed OSC frames; nothing to push back for them.
+                # But there might be non-OSC content in 'text' that your UI
+                # expects to see. If you need to preserve that, you can parse
+                # more carefully. Most cases won't need it.
+                set_status(f"[consumed osc 1337] {os.path.basename(p)}")
+                continue
+
+            # Next: your existing bracketed paste handling
+            if text.startswith("\x1b[200~"):
+                set_status(f"[attempt consume brack paste]")
+                end_idx = text.find("\x1b[201~")
+                if end_idx != -1:
+                    set_status(f"[consuming brack paste]")
+                    payload = text[6:end_idx]  # strip "\x1b[200~"
+                    first_line = payload.splitlines()[0].strip()
+                    if first_line.startswith("file://") or first_line.startswith("/"):
+                        p = first_line[7:] if first_line.startswith("file://") else first_line
+                        drag_ops.handle_drag_in(path, [p])
+                        set_status(f"[consumed brack paste]")
+                        set_status(f"[consumed brack] {os.path.basename(p)}")
+                        continue
+            # Not OSC-1337 and not bracketed paste → push back so normal keys work
+            _push_back(tail)
+
+
+        # 2) Fallback: quick-burst paste without bracketed markers
+        #    Heuristic: a slash or 'f' (for file://) followed by a burst, no newlines
+        if ch in (ord('/'), ord('f')):
+            tail = _read_more_nowait()
+            candidate = _ints_to_text([ch] + tail).strip()
+            if ("\x1b" not in candidate) and ("\n" not in candidate):
+                if candidate.startswith("file://") or candidate.startswith("/"):
+                    p = candidate[7:] if candidate.startswith("file://") else candidate
+                    # If multiple paths were pasted, take the first token/line
+                    p = p.split()[0].splitlines()[0]
+                    set_status(f"[request2] {os.path.basename(p)}")
+                    drag_ops.handle_drag_in(path, [p], set_status)
+                    
+                    continue
+            # Not a path → push back so the UI sees what user typed
+            _push_back(tail)
+        # ---------- end paste/drag detection ----------
+
+
+
         entries=list_entries(path)
         layout,total_h=build_layout(entries)
         vis_h=max(0,curses.LINES-TOP_Y-(HELP_FOOT+STATUS_FOOT))
