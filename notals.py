@@ -15,6 +15,8 @@ import shlex
 TRASH_DIR = os.path.expanduser("~/.local/share/notals_trash")
 os.makedirs(TRASH_DIR, exist_ok=True)
 
+CURRENT_UI_GLOBAL = None
+
 def move_to_trash(stdscr, srcp, name, set_status):
     # Use safer move so undo history is preserved
     ok = safer_move_or_copy(stdscr, srcp, name, TRASH_DIR, "move")
@@ -107,7 +109,7 @@ class ThingTools:
     @staticmethod
     def gather_tools(context, tool_groups):
         tool_entries = []
-
+        #print("TOOL GRP: " + str(tool_groups))
         for group_cls in tool_groups:
             group = group_cls()
 
@@ -117,6 +119,7 @@ class ThingTools:
             TOOL_PROF[group_cls.__name__]["detect"] += (time.time() - t0)
 
             if not ok:
+                #print('NOTOK: ' + str(group))
                 continue
 
             # --- measure tools() ---
@@ -130,14 +133,20 @@ class ThingTools:
                     hk = tool.hotkey
                     tool_entries.append((group.priority, hk, label, tool))
 
-        tool_entries.sort(key=lambda x: (x[0], x[1] or x[2]))
+        tool_entries.sort(
+            key=lambda x: (
+                x[0]() if callable(x[0]) else x[0],
+                x[1] or x[2],
+            )
+        )
+
         return [(hk, label, tool) for _, hk, label, tool in tool_entries]
 
 
 
 
 
-@lru_cache(maxsize=1)
+#@lru_cache(maxsize=1)
 def all_thingtools_classes():
     """
     Collect ThingTools subclasses and optionally extend with extras
@@ -145,6 +154,14 @@ def all_thingtools_classes():
     """
 
     found = set()
+    
+    try:
+        from notalstransit.NotalsTransitHubHub import NotalsTransitHubHub, NotalsTransitHub, SendFileTool
+        found.add(NotalsTransitHub)
+    except Exception as e:
+        pass
+        # print(f"[notals] WARN: TransitHub not loaded: {e}")
+
 
     def collect(cls):
         for sub in cls.__subclasses__():
@@ -163,7 +180,14 @@ def all_thingtools_classes():
             print(f"[notals] WARN: NOTALS_XTRAS enabled but extras failed to load: {exc}")
 
 
-    return sorted(found, key=lambda c: getattr(c, "priority", 50))
+    return sorted(
+    found,
+    key=lambda c: (
+        c.priority() if callable(getattr(c, "priority", None))
+        else getattr(c, "priority", 50)
+    )
+)
+
 
 
 class ThingToolsTool:
@@ -235,10 +259,44 @@ class ThingToolsToolContext:
 
     # --- curses state control ---
     def end_curses(self):
-        curses.endwin()
+        import curses
+        curses.def_prog_mode()   # ← save current tty & curses state!
+        curses.endwin()          # leave curses cleanly
+
 
     def restore_curses(self):
-        self.ui.redraw()
+        import curses
+
+        # 1. Restore terminal to curses program mode
+        try:
+            curses.reset_prog_mode()
+        except Exception:
+            stdscr = curses.initscr()
+        else:
+            stdscr = curses.stdscr if hasattr(curses, "stdscr") else None
+            if stdscr is None:
+                stdscr = curses.initscr()
+
+        # 2. Reinitialize input modes
+        curses.noecho()
+        curses.cbreak()
+        try:
+            curses.curs_set(0)
+        except:
+            pass
+
+        stdscr.keypad(True)
+
+        # 3. Re-bind NotalsUI’s stdscr to the *new* curses screen
+        self.ui.stdscr = stdscr
+
+        # 4. Force application to rebuild its view from scratch
+        try:
+            self.ui.redraw()
+        except Exception:
+            pass
+
+
 
     # --- command helpers ---
     def shell(self, cmd, pager=False):
@@ -306,9 +364,10 @@ def show_tools_menu(ui):
     )
 
     tool_classes = all_thingtools_classes()
+    #print("ALL CLS: " + str(tool_classes))
     tools = ThingTools.gather_tools(context, tool_classes)
     # tools looks like: [(hotkey, label, toolobj), ...]
-
+    #print("ALL TOOLS: " + str(tools))
     # Build display labels for menu:
     items = [
         (f"[{hk}] {label}" if hk else label)
@@ -1172,7 +1231,7 @@ class DockerTools(ThingTools):
 
 try:
     import boto3
-except ImportError:
+except Exception:
     boto3 = None
 
 class ECSEnhancementsMixin:
@@ -1830,6 +1889,145 @@ class ECSTools(ThingTools):
 
         return t
 
+import importlib.util
+import sys
+import os
+from pathlib import Path
+import zipimport
+
+
+class DelverTools(ThingTools):
+    name = "Delver"
+    priority = 35  # near other analysis/viewer groups
+
+    def _try_load_pyz(self):
+        """
+        Attempt to locate and import cursedelvermeta from a .pyz/.npz bundle.
+        If found, inserts the archive into sys.path for global visibility.
+        Returns True if import succeeded, else False.
+        """
+        import zipimport, sys
+        from pathlib import Path
+
+        search_names = ("cursedelver.pyz", "cursedelver.npz")
+        search_paths = [Path.cwd(), Path.home(), *map(Path, sys.path)]
+
+        for base in search_paths:
+            for name in search_names:
+                candidate = base / name
+                if candidate.is_file():
+                    try:
+                        # Insert into sys.path if not already there
+                        candidate_str = str(candidate.resolve())
+                        if candidate_str not in sys.path:
+                            sys.path.insert(0, candidate_str)
+
+                        # Try a standard import first (now that sys.path is patched)
+                        import importlib
+                        importlib.invalidate_caches()
+                        try:
+                            importlib.import_module("cursedelvermeta")
+                            return True
+                        except ImportError:
+                            # fallback: force import with zipimporter
+                            importer = zipimport.zipimporter(candidate_str)
+                            importer.load_module("cursedelvermeta")
+                            return True
+                    except Exception:
+                        continue
+        return False
+
+
+    def detect(self, cwd, system_info):
+        """Enable Delver integration if cursedelvermeta is available."""
+        try:
+            import cursedelvermeta
+            return True
+        except ImportError:
+            # try locating a self-contained archive
+            if self._try_load_pyz():
+                try:
+                    import cursedelvermeta
+                    return True
+                except ImportError:
+                    pass
+            return False
+
+    def tools(self, context):
+        return [DelveFileTool()]
+
+
+class DelveFileTool(ThingToolsTool):
+    label = "Inspect with Delver"
+    hotkey = "v"
+
+    @staticmethod
+    def _supported_exts():
+        """Collect advertised extensions from cursedelvermeta dynamically."""
+        exts = set()
+        try:
+            import cursedelvermeta
+            for block in cursedelvermeta.advertiseDelveableFileExtensions():
+                exts |= {e.lower() for e in block.get("extensions", []) if e != "*"}
+        except Exception:
+            exts |= {".mol", ".smi", ".sdf"}
+        return exts
+
+    def is_applicable(self, context):
+        """Offer the tool only if the selected path looks Delver-friendly."""
+        path = Path(getattr(context, "selected_file", ""))
+        return path.is_file() and path.suffix.lower() in self._supported_exts()
+
+    def safe_run(self, context):
+        """Launch Delver safely on the selected file."""
+        import curses
+        from pathlib import Path
+        import json
+        sys.__stdout__.write("raw debug message\n")
+        try:
+            import cursedelvermeta
+        except ImportError:
+            # If not already imported, try to recover using same pyz search
+            tools = DelverTools()
+            if not tools._try_load_pyz():
+                context.message("Delver unavailable: cursedelvermeta not found.")
+                return
+            import cursedelvermeta
+
+        curses.endwin()  # leave curses UI before Delver takes over
+
+        path = Path(context.selected_file)
+        ext = path.suffix.lower()
+        obj = str(path)
+
+        # Attempt lightweight eager loading for richer dispatch
+        try:
+            if ext in {".csv", ".tsv"}:
+                import pandas as pd
+                obj = pd.read_csv(path)
+            elif ext == ".npy":
+                import numpy as np
+                obj = np.load(path)
+            elif ext in {".json", ".yaml", ".yml", ".toml"}:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    if ext == ".json":
+                        obj = json.load(f)
+                    else:
+                        obj = f.read()
+            elif ext == ".smi":
+                obj = path.read_text(errors="ignore")
+        except Exception:
+            obj = str(path)
+
+        try:
+            cursedelvermeta.delve(obj)
+        finally:
+            # attempt to restore notals' curses session cleanly
+            try:
+                context.restore_curses()
+            except Exception:
+                pass
+
 
 
 from dataclasses import dataclass
@@ -2282,24 +2480,79 @@ class DragInOutOps:
     # Drag IN
     # ------------------------------------------------------------
     def handle_drag_in(self, cwd, incoming, fallback_print, mode=None):
-        
-        
+        """
+        Handle incoming drag-drop payloads.
+        - Optionally use Kitty OSC 1337 RequestFile.
+        - Gracefully fall back to NotalsTransitHubHub transports if Kitty fails or is disabled.
+        """
+
+        # kitty's file transfer behavior is a little obscure compared to the original image purpose!
+        USE_KITTY = False  # flip to False to skip Kitty logic entirely
+
         if not isinstance(incoming, (list, tuple)):
             if not self.allow_raw_payload or not self.payload_normalizer:
                 return ["[Rejected: raw drop payload]"]
             incoming = self.payload_normalizer(incoming)
 
         results = []
+
         for src in incoming:
             src = os.path.abspath(src)
             name = os.path.basename(src)
-            resreqfile = self.request_file_from_terminal(src)
-            results.append(resreqfile)
-            results.append(f"[request file exited] {name}")
-            
+            local_copy = os.path.join(cwd, name)
 
+            kitty_ok = False
+
+            # -------------------------------------------------------
+            # 1. Try Kitty request if enabled
+            # -------------------------------------------------------
+            if USE_KITTY:
+                try:
+                    resreqfile = self.request_file_from_terminal(src)
+                    results.append(resreqfile)
+
+                    # give Kitty a short grace period to deliver bytes
+                    time.sleep(0.3)
+
+                    if os.path.exists(local_copy) and os.path.getsize(local_copy) > 0:
+                        results.append(f"[kitty transfer ok] {name}")
+                        kitty_ok = True
+                    else:
+                        results.append(f"[kitty transfer incomplete] {name}")
+
+                except Exception as e:
+                    results.append(f"[kitty transfer error] {e}")
+
+            # -------------------------------------------------------
+            # 2. If Kitty disabled or failed → try TransitHub fallback
+            # -------------------------------------------------------
+            if not kitty_ok:
+                try:
+                    # Import transit hub only if needed (gracefully optional)
+                    try:
+                        from notalstransit.NotalsTransitHubHub import NotalsTransitHubHub, NotalsTransitHub
+                    except Exception as e:
+                        results.append(f"[no transit hub available] {e}")
+                        continue
+
+                    hub = NotalsTransitHubHub()
+
+                    # 'ctx' may live on ui or POUCH; both acceptable
+                    ctx = getattr(self.ui, "ctx", None) or getattr(self.POUCH, "ctx", None)
+                    ok, msg = hub.try_pull(ctx, remote_path=src, destdir=cwd)
+
+                    if ok:
+                        results.append(f"[fallback success] {msg}")
+                    else:
+                        results.append(f"[fallback failed] {msg}")
+
+                except Exception as e:
+                    results.append(f"[fallback error] {e}")
+
+        # Present combined results to user
         self.ui.show_message("; ".join(results))
         return results
+
         
         
         # ------------------------------------------------------------
@@ -2414,15 +2667,15 @@ def print_session_log():
         with open(LOG_FILE) as f: lines = f.readlines()
     except FileNotFoundError:
         print("\n[No log entries this session]"); return
-    print("\n========== notals Session Log ==========")
+    print("\n====== notals operations log (remove @ "+str(LOG_FILE)+") ==========")
     for line in lines[-30:]:
         try:
             e = json.loads(line)
             print(f"{e['time']}  {e['action'].upper():5}  {e['name']}  {e['src']} → {e['dst']}")
         except Exception: print(line.strip())
-    print("===========================================\n")
+    print("=========================================================================================\n")
 
-atexit.register(print_session_log)
+
 
 def draw_filter_bar(win):
     if not filter_active:
@@ -3475,6 +3728,7 @@ def generic_menu_dialog(stdscr, title, items):
 class NotalsUI:
     def __init__(self, stdscr):
         self.stdscr = stdscr
+        self._debug = []  
 
     def show_message(self, msg):
         rows, cols = self.stdscr.getmaxyx()
@@ -3490,10 +3744,20 @@ class NotalsUI:
     def text_preview_dialog(self, text, title):
         return text_preview_dialog(self.stdscr, title, text)
         
+        
+    def debug(self, msg):
+        self._debug.append(msg)
+        if len(self._debug) > 5000:    # prevent unbounded growth
+            self._debug = self._debug[-5000:]
+
+    def show_debug_log(self):
+        # Opens a simple scrolling text preview
+        text = "\n".join(self._debug) if self._debug else "(empty)"
+        return text_preview_dialog(self.stdscr, text, "Debug Log")
 
 
     def list_menu_dialog(self, items, title):
-        print("[DEBUG] Items:", items)
+        #print("[DEBUG] Items:", items)
 
         # If items are (hotkey, label) tuples → Tools menu → generic menu
         if items and isinstance(items[0], (tuple, list)):
@@ -3638,8 +3902,14 @@ def safe_make(path, name, set_status):
 
 
 # ---------------- main -----------------
-def main(stdscr):
+def main(stdscr=None, start_path=None):
+    """
+    Entry point for notals.
+    - stdscr: curses screen object (when run under curses.wrapper)
+    - start_path: optional starting directory, defaults to current working dir.
+    """
     global filter_active, filter_text, breadcrumb_mode, breadcrumb_positions, breadcrumb_index
+
     
     # Construct a minimal UI object that can send raw escape sequences
     class NotalsUIProxy:
@@ -3658,8 +3928,13 @@ def main(stdscr):
             pass
             
 
-    
+    atexit.register(print_session_log)
     tool_groups = all_thingtools_classes()
+    
+    try:
+        from notalstransit.NotalsTransitHubHub import NotalsTransitHubHub, NotalsTransitHub, SendFileTool
+    except Exception as e:
+        pass
 
     #for m in all_modules:
     #    if m.detect(): show menu section for it
@@ -3679,13 +3954,22 @@ def main(stdscr):
 
     try: stdscr.mousemask(curses.ALL_MOUSE_EVENTS|curses.REPORT_MOUSE_POSITION)
     except AttributeError: pass
-    path=os.getcwd(); history=[]; sel_idx=0; offset=0; drag=None; status=""
+    
+    if start_path:
+        path = os.path.abspath(os.path.expanduser(start_path))
+        if not os.path.isdir(path):
+            path = os.getcwd()
+    else:
+        path = os.getcwd()
+    
+    history=[]; sel_idx=0; offset=0; drag=None; status=""
     B4=getattr(curses,"BUTTON4_PRESSED",0); B5=getattr(curses,"BUTTON5_PRESSED",0)
 
     def set_status(msg):
         nonlocal status
         status=msg; sadd(stdscr,curses.LINES-3,2," "*(curses.COLS-4)); sadd(stdscr,curses.LINES-3,2,msg)
         
+    
         
     ui1337 = NotalsUIProxy(stdscr)
     
@@ -3702,7 +3986,7 @@ def main(stdscr):
     layout,total_h,vis_h,offset=draw_view(stdscr,path,sel_idx,offset)
     
     last_click_time = 0
-    double_click_grace = 1.5  # seconds; adjust if needed
+    double_click_grace = 2  # seconds; adjust if needed
 
     while True:
 
@@ -3939,6 +4223,15 @@ def main(stdscr):
                 set_status(f"[Project actions: {ptype}]")
             else:
                 set_status("[No project actions available here]")
+        elif ch == 4:  # Ctrl-Shift-G (very unlikely to conflict with UI)
+            global CURRENT_UI_GLOBAL
+            if CURRENT_UI_GLOBAL is None:
+                ui = NotalsUI(stdscr)
+            else:
+                ui = CURRENT_UI_GLOBAL
+            
+            ui.debug("[HOTKEY] Debug log opened")
+            ui.show_debug_log()
 
         elif ch==curses.KEY_DOWN and entries:
             sel_idx=min(sel_idx+1,len(entries)-1); c=layout[sel_idx]; offset=ensure_visible(offset,vis_h,c["top"],c["bottom"])
@@ -3980,9 +4273,18 @@ def main(stdscr):
                 system_info=None,
                 clipboard=None,
             )
+            
+             
+            try:
+                from notalstransit.NotalsTransitHubHub import NotalsTransitHubHub, NotalsTransitHub, SendFileTool
+            except Exception as e:
+                pass
 
             # Gather relevant tools
+            tool_classes_temp = all_thingtools_classes()
+            #print("ALL CLS: " + str(tool_classes_temp))
             tools = ThingTools.gather_tools(ctx, all_thingtools_classes())
+            #print("ALL TOOLS: " + str(tools))
             if not tools:
                 set_status("[No tools available here]")
                 continue
@@ -3992,6 +4294,7 @@ def main(stdscr):
                 (f"[{hk}] {label}" if hk else label)
                 for (hk, label, tool) in tools
             ]
+            #print(str(items))
 
             # Present selection menu → returns index or None
             choice = ctx.list_menu(items, title="Tools")
@@ -4192,7 +4495,17 @@ def main(stdscr):
     if os.environ.get("NOTALS_PRINT_CWD") == "1":
         curses.endwin()
         print(path, end="")
+        
+def run(start_path=None):
+    import curses
+    curses.wrapper(lambda scr: main(scr, start_path))
 
-if __name__=="__main__":
-    curses.wrapper(main)
+
+if __name__ == "__main__":
+    import sys, curses
+    arg = sys.argv[1] if len(sys.argv) > 1 else None
+    if arg:
+        curses.wrapper(lambda stdscr: main(stdscr, arg))
+    else:
+        curses.wrapper(main)
 

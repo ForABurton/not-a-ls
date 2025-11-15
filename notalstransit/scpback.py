@@ -38,6 +38,8 @@ import sys
 import os
 import pty
 import time
+import shutil
+import json
 
 OSC_REQUEST_TMPL = b"\x1b]1337;XFER-REQUEST={payload}\x07"
 
@@ -126,9 +128,10 @@ def request_via_pty(ssh_args, path, timeout=5):
             pass
 
 
+
 def main():
     ap = argparse.ArgumentParser(prog="scpback")
-ap.add_argument("--mode", choices=["auto","scp","osc"], default="auto", help="Transfer mode preference (default: auto)")
+    ap.add_argument("--mode", choices=["auto","scp","osc"], default="auto", help="Transfer mode preference (default: auto)")
     ap.add_argument("--ssh", required=True, nargs='+',
                     help="SSH target split into argv form: user@host (or pass through multiple args)"
                     )
@@ -146,37 +149,6 @@ ap.add_argument("--mode", choices=["auto","scp","osc"], default="auto", help="Tr
 
     ssh_target = args.ssh[0] if len(args.ssh) == 1 else None
 
-    # If a singlessh token passed (user@host), use run_ssh_command API which accepts that form.
-    if args.pull:
-        # unified pull logic
-        target = args.pull
-        mode = args.mode
-        # auto-detect: tty + TERM indicates OSC support
-        if mode == "auto":
-            if sys.stdout.isatty() and os.environ.get("TERM","" ).lower() in ("xterm-256color","wezterm","iterm2","kitty","xterm-kitty"):
-                mode = "osc"
-            else:
-                mode = "scp"
-        if mode == "scp":
-            if not ssh_target:
-                print("pull (scp mode) requires a single ssh target like user@host", file=sys.stderr)
-                sys.exit(2)
-            try:
-                resolved = resolve_remote(ssh_target, target)
-                subprocess.run(["scp", f"{ssh_target}:{resolved}", "."], check=True)
-                print(f"Copied to ./`basename {target}`")
-            except Exception as e:
-                print(f"ERROR (scp pull): {e}", file=sys.stderr)
-                sys.exit(1)
-        else:  # osc
-            ok, out = request_via_pty(args.ssh, target, timeout=args.timeout)
-            if ok:
-                print("OSC request sent; remote side must perform the transfer.", file=sys.stderr)
-                sys.exit(0)
-            else:
-                print("OSC request failed.", file=sys.stderr)
-                sys.exit(1)
-
     if args.pull:
         target = args.pull
         mode = args.mode
@@ -192,7 +164,7 @@ ap.add_argument("--mode", choices=["auto","scp","osc"], default="auto", help="Tr
             sys.exit(1)
         # Detect OSC-capable terminal (very simple heuristic)
         osc_ok = False
-        if mode == "osc" or (mode == "auto" and sys.stdout.isatty() and os.environ.get("TERM", "").lower() in ("xterm-256color", "wezterm", "iTerm2", "kitty")):
+        if mode == "osc" or (mode == "auto" and sys.stdout.isatty() and os.environ.get("TERM", "").lower() in ("xterm-256color", "wezterm", "iterm2", "kitty")):
             osc_ok = True
         # Prefer OSC if selected/available
         if osc_ok:
